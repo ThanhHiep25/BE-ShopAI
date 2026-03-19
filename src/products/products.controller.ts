@@ -34,8 +34,26 @@ export class ProductsController {
     @Query('limit') limit: number = 10,
     @Query('category') category?: string,
     @Query('q') query?: string,
+    @Query('minPrice') minPrice?: number,
+    @Query('maxPrice') maxPrice?: number,
+    @Query('minRating') minRating?: number,
+    @Query('sort') sort?: 'price_asc' | 'price_desc' | 'newest' | 'rating_desc',
   ) {
-    return this.productsService.findAll(+page, +limit, category, query);
+    return this.productsService.findAll(
+      +page, 
+      +limit, 
+      category, 
+      query, 
+      minPrice ? +minPrice : undefined,
+      maxPrice ? +maxPrice : undefined,
+      minRating ? +minRating : undefined,
+      sort
+    );
+  }
+
+  @Get(':id/similar')
+  async findSimilar(@Param('id') id: string, @Query('limit') limit: number = 4) {
+    return this.productsService.findSimilar(id, +limit);
   }
 
   @Get('categories')

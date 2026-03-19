@@ -2,10 +2,14 @@ import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/commo
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { Review, ReviewDocument } from './schemas/review.schema';
+import { Product, ProductDocument } from '../products/schemas/product.schema';
 
 @Injectable()
 export class ReviewsService {
-  constructor(@InjectModel(Review.name) private reviewModel: Model<ReviewDocument>) {}
+  constructor(
+    @InjectModel(Review.name) private reviewModel: Model<ReviewDocument>,
+    @InjectModel(Product.name) private productModel: Model<ProductDocument>,
+  ) {}
 
   async create(productId: string, userId: string, rating: number, comment?: string): Promise<ReviewDocument> {
     const review = new this.reviewModel({
@@ -14,7 +18,9 @@ export class ReviewsService {
       rating,
       comment,
     });
-    return review.save();
+    const savedReview = await review.save();
+    await this.updateProductRating(productId);
+    return savedReview;
   }
 
   async findByProduct(productId: string): Promise<ReviewDocument[]> {
@@ -41,7 +47,9 @@ export class ReviewsService {
     if (review.userId.toString() !== userId) {
       throw new ForbiddenException('You can only delete your own reviews');
     }
+    const productId = review.productId.toString();
     await this.reviewModel.deleteOne({ _id: id });
+    await this.updateProductRating(productId);
   }
 
   async getAverageRating(productId: string): Promise<number> {
@@ -50,5 +58,30 @@ export class ReviewsService {
       { $group: { _id: '$productId', avgRating: { $avg: '$rating' } } },
     ]);
     return result.length > 0 ? result[0].avgRating : 0;
+  }
+
+  private async updateProductRating(productId: string): Promise<void> {
+    const stats = await this.reviewModel.aggregate([
+      { $match: { productId: new Types.ObjectId(productId) } },
+      {
+        $group: {
+          _id: '$productId',
+          avgRating: { $avg: '$rating' },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    if (stats.length > 0) {
+      await this.productModel.findByIdAndUpdate(productId, {
+        averageRating: stats[0].avgRating,
+        reviewCount: stats[0].count,
+      });
+    } else {
+      await this.productModel.findByIdAndUpdate(productId, {
+        averageRating: 0,
+        reviewCount: 0,
+      });
+    }
   }
 }

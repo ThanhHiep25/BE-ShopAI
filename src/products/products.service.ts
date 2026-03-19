@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, Logger, BadRequestException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import { Product, ProductDocument } from './schemas/product.schema';
 
 import { CloudinaryService } from '../common/cloudinary/cloudinary.service';
@@ -53,7 +53,16 @@ export class ProductsService {
     }
   }
 
-  async findAll(page: number = 1, limit: number = 10, category?: string, query?: string): Promise<{ products: ProductDocument[], total: number, page: number, lastPage: number }> {
+  async findAll(
+    page: number = 1,
+    limit: number = 10,
+    category?: string,
+    query?: string,
+    minPrice?: number,
+    maxPrice?: number,
+    minRating?: number,
+    sort?: 'price_asc' | 'price_desc' | 'newest' | 'rating_desc',
+  ): Promise<{ products: ProductDocument[], total: number, page: number, lastPage: number }> {
     const skip = (page - 1) * limit;
     const filter: any = {};
     
@@ -68,8 +77,23 @@ export class ProductsService {
       ];
     }
 
+    if (minPrice !== undefined || maxPrice !== undefined) {
+      filter.price = {};
+      if (minPrice !== undefined) filter.price.$gte = minPrice;
+      if (maxPrice !== undefined) filter.price.$lte = maxPrice;
+    }
+
+    if (minRating !== undefined) {
+      filter.averageRating = { $gte: minRating };
+    }
+
+    let sortOption: any = { createdAt: -1 };
+    if (sort === 'price_asc') sortOption = { price: 1 };
+    if (sort === 'price_desc') sortOption = { price: -1 };
+    if (sort === 'rating_desc') sortOption = { averageRating: -1 };
+
     const [products, total] = await Promise.all([
-      this.productModel.find(filter).populate('sellerId', 'name email').sort({ createdAt: -1 }).skip(skip).limit(limit).exec(),
+      this.productModel.find(filter).populate('sellerId', 'name email').sort(sortOption).skip(skip).limit(limit).exec(),
       this.productModel.countDocuments(filter).exec(),
     ]);
 
@@ -79,6 +103,19 @@ export class ProductsService {
       page,
       lastPage: Math.ceil(total / limit),
     };
+  }
+
+  async findSimilar(productId: string, limit: number = 4): Promise<ProductDocument[]> {
+    const product = await this.productModel.findById(productId);
+    if (!product) return [];
+
+    return this.productModel
+      .find({
+        category: product.category,
+        _id: { $ne: new Types.ObjectId(productId) },
+      })
+      .limit(limit)
+      .exec();
   }
 
   async findOne(id: string): Promise<ProductDocument> {

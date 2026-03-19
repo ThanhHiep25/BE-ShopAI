@@ -47,8 +47,57 @@ export class AiService {
     return result.response;
   }
 
-  async recommendProducts(prompt: string, sessionId?: string) {
-    return this.generateRecommendationResult(prompt, sessionId);
+  async recommendProducts(prompt: string, sessionId?: string, contextProductId?: string) {
+    return this.generateRecommendationResult(prompt, sessionId, contextProductId);
+  }
+
+  async optimizeContent(type: 'title' | 'description', text: string, name?: string): Promise<string> {
+    const prompt = type === 'title' 
+      ? `Toi la mot chuyen gia marketing. Hay toi uu tieu de san pham sau day de thu hut nguoi mua hon: "${text}". Chi tra ve tieu de moi, khong giai thich them.`
+      : `Toi la mot chuyen gia viet noi dung (copywriter). Hay viet mot mo ta san pham chuyen nghiep, day du tinh nang va loi ich cho san pham co ten la "${name || 'san pham nay'}" dua tren cac y tuong sau: "${text}". Tra ve noi dung mo ta bang tieng Viet, co format ro rang.`;
+
+    try {
+      return await this.chatWithGemini(prompt);
+    } catch {
+      const response = await this.openai.chat.completions.create({
+        model: 'gpt-3.5-turbo',
+        messages: [{ role: 'user', content: prompt }],
+      });
+      return response.choices[0].message.content || text;
+    }
+  }
+
+  async suggestPrice(name: string, category?: string): Promise<{ suggestedPrice: number; reason: string }> {
+    const similarProducts = await this.productModel.find({
+      $or: [
+        { name: { $regex: name.split(' ')[0], $options: 'i' } },
+        { category: category }
+      ]
+    }).limit(10).lean().exec();
+
+    if (similarProducts.length === 0) {
+      return { suggestedPrice: 0, reason: "Khong tim thay san pham tuong tu de so sanh." };
+    }
+
+    const avgPrice = similarProducts.reduce((sum, p) => sum + p.price, 0) / similarProducts.length;
+    const minPrice = Math.min(...similarProducts.map(p => p.price));
+    const maxPrice = Math.max(...similarProducts.map(p => p.price));
+
+    const prompt = `Toi la chuyen gia phan tich gia thi truong. San pham moi ten la "${name}", thuoc danh muc "${category || 'N/A'}". 
+    Cac san pham tuong tu co gia tu ${minPrice.toLocaleString()} den ${maxPrice.toLocaleString()} VND, trung binh la ${avgPrice.toLocaleString()} VND.
+    Hay goi y mot muc gia ban hop ly va giai thich tai sao. Tra ve format JSON: {"suggestedPrice": number, "reason": "string"}`;
+
+    try {
+      const aiResult = await this.chatWithGemini(prompt);
+      // Clean possible markdown code blocks
+      const cleanJson = aiResult.replace(/```json|```/g, '').trim();
+      return JSON.parse(cleanJson);
+    } catch {
+      return { 
+        suggestedPrice: Math.round(avgPrice), 
+        reason: `Dua tren gia trung binh cua ${similarProducts.length} san pham tuong tu trong he thong.` 
+      };
+    }
   }
 
   async getConversationHistory(sessionId: string) {
@@ -134,7 +183,7 @@ export class AiService {
   }
 
   private async getCatalogProducts(): Promise<CatalogProduct[]> {
-    const products = await this.productModel.find().limit(50).lean().exec();
+    const products = await this.productModel.find().limit(100).lean().exec();
 
     return products.map((product) => ({
       id: String(product._id),
@@ -149,6 +198,7 @@ export class AiService {
   private async generateRecommendationResult(
     prompt: string,
     sessionId?: string,
+    contextProductId?: string,
   ): Promise<{
     response: string;
     products: CatalogProduct[];
@@ -156,12 +206,44 @@ export class AiService {
     const resolvedSessionId = sessionId || 'default';
     const products = await this.getCatalogProducts();
     const recentContext = await this.getRecentSessionContext(resolvedSessionId);
+    
+    let productContextInfo = '';
+    let contextProductObj: CatalogProduct | null = null;
+    
+    if (contextProductId) {
+      const dbProduct = await this.productModel.findById(contextProductId).lean().exec();
+      if (dbProduct) {
+        contextProductObj = {
+          id: String(dbProduct._id),
+          name: dbProduct.name,
+          description: dbProduct.description,
+          price: dbProduct.price,
+          category: dbProduct.category,
+          imageUrl: dbProduct.images?.[0],
+        };
+        productContextInfo = `CHÚ Ý: Người dùng ĐANG XEM sản phẩm này: 
+        - Tên: ${contextProductObj.name}
+        - Giá: ${contextProductObj.price.toLocaleString('vi-VN')} VND
+        - Danh mục: ${contextProductObj.category || 'N/A'}
+        - Mô tả: ${contextProductObj.description}
+        Hãy ƯU TIÊN trả lời các câu hỏi dựa trên sản phẩm này. Nếu người dùng hỏi chung chung như 'nó có tốt không' hay 'giá bao nhiêu', hãy hiểu là họ đang hỏi về sản phẩm này.`;
+      }
+    }
+
     const intent = this.detectIntent(prompt);
-    const relevantProducts = this.findRelevantProducts(
+    let relevantProducts = this.findRelevantProducts(
       prompt,
       products,
       intent,
     );
+
+    // If we have a context product, make sure it's at the top of the list
+    if (contextProductObj) {
+      relevantProducts = [
+        contextProductObj,
+        ...relevantProducts.filter(p => p.id !== contextProductObj?.id)
+      ].slice(0, 5);
+    }
 
     if (this.shouldUseDirectCatalogAnswer(intent, relevantProducts)) {
       const responseText = this.generateCatalogFallback(
@@ -193,6 +275,7 @@ export class AiService {
       relevantProducts,
       intent,
       recentContext,
+      productContextInfo,
     );
 
     try {
@@ -320,8 +403,12 @@ export class AiService {
       return 'recommendation';
     }
 
-    if (/san pham|co gi|nhung gi|danh muc|ban gi/.test(normalizedPrompt)) {
-      return 'catalog';
+    if (
+      /giat|phoi|say|tu lanh|dieu hoa|gia dung|tv|tivi|may anh/.test(
+        normalizedPrompt,
+      )
+    ) {
+      return 'recommendation';
     }
 
     return 'general';
@@ -428,13 +515,12 @@ export class AiService {
       .sort((a, b) => b.score - a.score);
 
     if (scored.length === 0) {
-      if (intent === 'recommendation') {
-        return [...candidateProducts]
-          .sort((a, b) => a.price - b.price)
-          .slice(0, 5);
+      // If we don't have a specific match, and the intent is catalog or general, we can return some featured ones.
+      // But for recommendation or price, we should BE HONEST and return empty if no good match.
+      if (intent === 'catalog' || intent === 'general') {
+        return candidateProducts.slice(0, 5);
       }
-
-      return candidateProducts.slice(0, 5);
+      return [];
     }
 
     const ranked = scored.slice(0, 5).map((item) => item.product);
@@ -464,25 +550,23 @@ export class AiService {
     relevantProducts: CatalogProduct[],
     intent: AiIntent,
     recentContext: string,
+    productContextInfo: string,
   ): string {
-    const catalogSummary =
-      relevantProducts.length > 0 ? relevantProducts : products.slice(0, 8);
+    const catalogSummary = relevantProducts;
     const budget = this.extractBudget(prompt);
 
-    const catalogText = catalogSummary
-      .map(
-        (product, index) =>
-          `${index + 1}. ${product.name} | gia: ${product.price} VND | danh muc: ${product.category ?? 'Chua ro'} | mo ta: ${product.description}`,
-      )
-      .join('\n');
+    const catalogText = catalogSummary.length > 0 
+      ? catalogSummary.map((product, index) => `${index + 1}. ${product.name} | gia: ${product.price} VND | danh muc: ${product.category ?? 'Chua ro'} | mo ta: ${product.description}`).join('\n')
+      : 'HIỆN TẠI KHÔNG TÌM THẤY SẢN PHẨM PHÙ HỢP TRONG CATALOG CỦA ShopAI.';
 
     return [
       'Vai tro: Ban la tu van vien ban hang cua ShopAI.',
       'Muc tieu: tra loi huu ich, ngan gon, ro gia va cong dung, co the dua ra goi y mua hang.',
       `Intent du doan: ${intent}`,
       recentContext
-        ? `Lich su hoi dap gan day (cung session):\n${recentContext}`
-        : 'Chua co lich su hoi dap truoc do cho session nay.',
+        ? `Lịch sử hội thoại gần đây:\n${recentContext}`
+        : 'Chưa có lịch sử hội thoại trước đó.',
+      productContextInfo ? `Bối cảnh sản phẩm đang xem:\n${productContextInfo}` : '',
       budget
         ? `Ngan sach phat hien: ${budget} VND`
         : 'Khong phat hien ngan sach cu the.',
